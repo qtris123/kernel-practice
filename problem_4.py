@@ -52,8 +52,28 @@ def _flash_attention_forward_causal_kernel(
         # Implement the logic for the off-diagonal blocks.
         # This is very similar to the non-causal version from Problem 3.
         # 1. Load the K and V blocks for the current iteration.
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr +  batch_idx * k_stride_b + head_idx * k_stride_h + \
+            (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask = k_offsets[None, :] < SEQ_LEN , other = 0.0)
+
+        v_offsets = start_n + tl.arange(0, BLOCK_N)
+        v_ptrs = V_ptr + batch_idx * v_stride_b + head_idx * v_stride_h + \
+            (v_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask = v_offsets[:, None] < SEQ_LEN, other = 0.0)
+
         # 2. Compute the attention scores (S_ij).
+        S_ij = tl.dot(q_block, k_block)
+        ## mask = (start_n + k_offsets[:, None]) <= q_offsets[None, :] # don't quite get this part???
+        S_ij *= qk_scale ##+ tl.where(mask, 0, -1.0e6)
         # 3. Update the online softmax statistics (m_i, l_i) and the accumulator (acc).
+        m_ij = tl.maximum(m_i, tl.max(S_ij, 1))
+        scale_factor = tl.exp2(m_i - m_ij)
+        P_ij = tl.exp2(S_ij - m_ij[:, None])
+        l_i = l_i * scale_factor + tl.sum(P_ij, 1)
+        acc = acc * scale_factor[:, None] + tl.dot(P_ij.to(v_block.type), v_block)
+
+        m_i = m_ij
         pass
         # --- END OF STUDENT IMPLEMENTATION ---
 
@@ -64,6 +84,29 @@ def _flash_attention_forward_causal_kernel(
     for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
         # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
         # Implement the logic for the diagonal blocks, apply the causal mask to S_ij.
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + head_idx * k_stride_h + \
+            (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask = k_offsets[None, :] < SEQ_LEN , other = 0.0)
+
+        v_offsets = start_n + tl.arange(0, BLOCK_N)
+        v_ptrs = V_ptr + batch_idx * v_stride_b + head_idx * v_stride_h + \
+            (v_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask = v_offsets[:, None] < SEQ_LEN, other = 0.0)
+
+        # 2. Compute the attention scores (S_ij).
+        S_ij = tl.dot(q_block, k_block)
+        mask = (k_offsets[None, :]) <= q_offsets[:, None] # don't quite get this part???
+        S_ij = tl.where(mask, S_ij, -float('inf'))
+        S_ij *= qk_scale
+        # 3. Update the online softmax statistics (m_i, l_i) and the accumulator (acc).
+        m_ij = tl.maximum(m_i, tl.max(S_ij, 1))
+        scale_factor = tl.exp2(m_i - m_ij) # * 1.44269504
+        P_ij = tl.exp2(S_ij - m_ij[:, None])
+        l_i = l_i * scale_factor + tl.sum(P_ij, 1)
+        acc = acc * scale_factor[:, None] + tl.dot(P_ij.to(v_block.type), v_block)
+
+        m_i = m_ij  
         pass
         # --- END OF STUDENT IMPLEMENTATION ---
 

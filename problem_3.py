@@ -39,8 +39,9 @@ def _flash_attention_forward_kernel(
     q_offsets = (q_block_idx * BLOCK_M + tl.arange(0, BLOCK_M))
     q_ptrs = Q_ptr + batch_idx * q_stride_b + head_idx * q_stride_h + \
              (q_offsets[:, None] * q_stride_s + tl.arange(0, HEAD_DIM)[None, :])
-    q_block = tl.load(q_ptrs, mask=q_offsets[:, None] < SEQ_LEN, other=0.0)
-    
+    # a block of a [BATCH_NUM, HEAD_NUM, q_offsets[:, None] * q_stride_s :, :] => contains the unprocessed tokens, masking here is to only process the limit number of tokens
+    q_block = tl.load(q_ptrs, mask=q_offsets[:, None] < SEQ_LEN, other=0.0) 
+
     # PyTorch softmax is exp(x), Triton is exp2(x * log2(e)), log2(e) is approx 1.44269504
     qk_scale = softmax_scale * 1.44269504
 
@@ -61,15 +62,43 @@ def _flash_attention_forward_kernel(
                  (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
         v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
 
-        # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
-        # Implement the online softmax update logic.
+        #  # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
+        # # Implement the online softmax update logic.
+        # # 1. Find the new running maximum (`m_new`).
+        # m_ij = tl.max(s_ij, axis = 1).to(torch.float32)
+        # m_new = tl.maximum(m_i, m_ij).to(torch.float32)
+        # # 2. Rescale the existing accumulator (`acc`) and denominator (`l_i`).
+        # scale_factor = tl.exp(m_i - m_new).to(torch.float32)
+        # acc *= scale_factor[:, None].to(torch.float32)
+        # l_i *= scale_factor.to(torch.float32)
+        # # 3. Compute the attention probabilities for the current tile (`p_ij`).
+        # p_ij = tl.exp(s_ij.to(torch.float32) - m_new[:, None])
+        # # 4. Update the accumulator `acc` using `p_ij` and `v_block`.
+        # acc += (p_ij.to(v_block.type) @ v_block).to(torch.float32)
+        # # 5. Update the denominator `l_i`.
+        # l_i += tl.sum(p_ij, axis = 1).to(torch.float32)
+        # # 6. Update the running maximum `m_i` for the next iteration.
+        # m_i = m_new
+        # pass
+        # -------------------------
         # 1. Find the new running maximum (`m_new`).
+        m_ij = tl.max(s_ij, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
         # 2. Rescale the existing accumulator (`acc`) and denominator (`l_i`).
+        # Use tl.exp2 for Triton's online softmax formulation.
+        scale_factor = tl.exp2(m_i - m_new)
+        acc *= scale_factor[:, None]
+        l_i *= scale_factor
         # 3. Compute the attention probabilities for the current tile (`p_ij`).
+        p_ij = tl.exp2(s_ij - m_new[:, None])
         # 4. Update the accumulator `acc` using `p_ij` and `v_block`.
+        acc += tl.dot(p_ij.to(v_block.type), v_block)
         # 5. Update the denominator `l_i`.
+        l_i += tl.sum(p_ij, axis=1)
         # 6. Update the running maximum `m_i` for the next iteration.
+        m_i = m_new
         pass
+
         # --- END OF STUDENT IMPLEMENTATION ---
 
 
@@ -102,7 +131,7 @@ def flash_attention_forward(q, k, v):
         seq_len,
         n_heads,
         HEAD_DIM=head_dim,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        BLOCK_M=BLOCK_M, #size of each Q block 
+        BLOCK_N=BLOCK_N, #size of each KV block
     )
     return o

@@ -35,8 +35,8 @@ def _flash_attention_forward_gqa_kernel(
     # Your goal is to map the current query head (q_head_idx) to its corresponding shared key/value head (kv_head_idx).
     # 1. Calculate how many query heads are in each group.
     # 2. Use integer division to find the correct kv_head_idx.
-    
-    kv_head_idx = 0 # Placeholder: Replace with your calculation
+    group_size = N_Q_HEADS // N_KV_HEADS
+    kv_head_idx = q_head_idx // group_size # Placeholder: Replace with your calculation
     # --- END OF STUDENT IMPLEMENTATION ---
 
 
@@ -57,8 +57,28 @@ def _flash_attention_forward_gqa_kernel(
     for start_n in range(0, q_block_idx * BLOCK_M, BLOCK_N):
         # --- STUDENT IMPLEMENTATION REQUIRED HERE (Part 2) ---
         # 1. Modify the pointer arithmetic for K and V to use your `kv_head_idx`.
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr +  batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+            (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask = k_offsets[None, :] < SEQ_LEN , other = 0.0)
+
+        v_offsets = start_n + tl.arange(0, BLOCK_N)
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+            (v_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask = v_offsets[:, None] < SEQ_LEN, other = 0.0)
+
         # 2. Reuse your working implementation for the online softmax update
-        #    from your solution to Problem 4.
+        S_ij = tl.dot(q_block, k_block)
+        ## mask = (start_n + k_offsets[:, None]) <= q_offsets[None, :] # don't quite get this part???
+        S_ij *= qk_scale ##+ tl.where(mask, 0, -1.0e6)
+        # 3. Update the online softmax statistics (m_i, l_i) and the accumulator (acc).
+        m_ij = tl.maximum(m_i, tl.max(S_ij, 1))
+        scale_factor = tl.exp2(m_i - m_ij)
+        P_ij = tl.exp2(S_ij - m_ij[:, None])
+        l_i = l_i * scale_factor + tl.sum(P_ij, 1)
+        acc = acc * scale_factor[:, None] + tl.dot(P_ij.to(v_block.type), v_block)
+
+        m_i = m_ij
         pass
         # --- END OF STUDENT IMPLEMENTATION ---
 
@@ -67,8 +87,28 @@ def _flash_attention_forward_gqa_kernel(
     for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
         # --- STUDENT IMPLEMENTATION REQUIRED HERE (Part 3) ---
         # 1. Modify the pointer arithmetic for K and V to use your `kv_head_idx`.
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+            (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask = k_offsets[None, :] < SEQ_LEN , other = 0.0)
+
+        v_offsets = start_n + tl.arange(0, BLOCK_N)
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+            (v_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask = v_offsets[:, None] < SEQ_LEN, other = 0.0)
         # 2. Reuse your working implementation for the masked online softmax
-        #    update from your solution to Problem 4.
+        S_ij = tl.dot(q_block, k_block)
+        mask = (k_offsets[None, :]) <= q_offsets[:, None] # don't quite get this part???
+        S_ij = tl.where(mask, S_ij, -float('inf'))
+        S_ij *= qk_scale
+        # 3. Update the online softmax statistics (m_i, l_i) and the accumulator (acc).
+        m_ij = tl.maximum(m_i, tl.max(S_ij, 1))
+        scale_factor = tl.exp2(m_i - m_ij) # * 1.44269504
+        P_ij = tl.exp2(S_ij - m_ij[:, None])
+        l_i = l_i * scale_factor + tl.sum(P_ij, 1)
+        acc = acc * scale_factor[:, None] + tl.dot(P_ij.to(v_block.type), v_block)
+
+        m_i = m_ij  
         pass
         # --- END OF STUDENT IMPLEMENTATION ---
 

@@ -54,10 +54,99 @@ def _flash_attention_forward_swa_kernel(
     # Combine the GQA, SWA, and Sink logic.
     # Combine all code from previous problems, and add the sink logic.
     # You should have 3 phases:
-    # 1. Phase 0: Sink blocks that are before the sliding window
-    # 2. Phase 1: Off-Diagonal Blocks (within the window)
-    # 3. Phase 2: Diagonal Blocks
-    pass
+    # --- Phase 0: Sink attention:
+    # Phase 0: Sink blocks
+    diag_start = q_block_idx * BLOCK_M
+    window_start = tl.maximum(0, diag_start - WINDOW_SIZE + 1)
+    
+    for start_n in range(0, SINK_SIZE, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        v_offsets = start_n + tl.arange(0, BLOCK_N)
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (v_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=v_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        S_ij = tl.dot(q_block, k_block)
+        S_ij *= qk_scale
+        
+        m_ij = tl.maximum(m_i, tl.max(S_ij, 1))
+        scale_factor = tl.exp2(m_i - m_ij)
+        P_ij = tl.exp2(S_ij - m_ij[:, None])
+        l_i = l_i * scale_factor + tl.sum(P_ij, 1)
+        acc = acc * scale_factor[:, None] + tl.dot(P_ij.to(v_block.type), v_block)
+        m_i = m_ij
+
+        pass
+    # --- Phase 1: Off-Diagonal Blocks (within the window) ---
+    for start_n in range(tl.maximum(SINK_SIZE, window_start), q_block_idx * BLOCK_M, BLOCK_N):
+        # STUDENT IMPLEMENTATION REQUIRED (Part 3: SWA Logic)
+        # Hint: You might need to apply the per-element sliding window mask to s_ij.
+        #    - A score is invalid if `(query_offset - key_offset) >= WINDOW_SIZE`.
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr +  batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+            (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask = k_offsets[None, :] < SEQ_LEN , other = 0.0)
+
+        v_offsets = start_n + tl.arange(0, BLOCK_N)
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+            (v_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask = v_offsets[:, None] < SEQ_LEN, other = 0.0)
+
+        # 2. Reuse your working implementation for the online softmax update
+        S_ij = tl.dot(q_block, k_block)
+        ## mask = (start_n + k_offsets[:, None]) <= q_offsets[None, :] # don't quite get this part???
+        # Applying sliding window mask:
+        # delta = i - j; valid iff 0 <= delta < WINDOW_SIZE
+        delta = q_offsets[:, None] - k_offsets[None, :]
+        sw_mask = (delta >= 0) & (delta < WINDOW_SIZE)
+        S_ij = tl.where(sw_mask, S_ij, -10000)
+
+        S_ij *= qk_scale ##+ tl.where(mask, 0, -1.0e6)
+        # 3. Update the online softmax statistics (m_i, l_i) and the accumulator (acc).
+        m_ij = tl.maximum(m_i, tl.max(S_ij, 1))
+        scale_factor = tl.exp2(m_i - m_ij)
+        P_ij = tl.exp2(S_ij - m_ij[:, None])
+        l_i = l_i * scale_factor + tl.sum(P_ij, 1)
+        acc = acc * scale_factor[:, None] + tl.dot(P_ij.to(v_block.type), v_block)
+
+        m_i = m_ij
+        pass
+
+    # --- Phase 2: Diagonal Blocks ---
+    diag_start = q_block_idx * BLOCK_M
+    for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
+        # STUDENT IMPLEMENTATION REQUIRED
+        # 1. Modify the pointer arithmetic for K and V to use your `kv_head_idx`.
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+            (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask = k_offsets[None, :] < SEQ_LEN , other = 0.0)
+
+        v_offsets = start_n + tl.arange(0, BLOCK_N)
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+            (v_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask = v_offsets[:, None] < SEQ_LEN, other = 0.0)
+        # 2. Reuse your working implementation for the masked online softmax
+        S_ij = tl.dot(q_block, k_block)
+         # apply sliding window mask
+        delta = q_offsets[:, None] - k_offsets[None,:] 
+        sw_mask = (delta >= 0) & (delta < WINDOW_SIZE)
+        S_ij = tl.where(sw_mask, S_ij, -10000)
+
+        S_ij *= qk_scale
+        # 3. Update the online softmax statistics (m_i, l_i) and the accumulator (acc).
+        m_ij = tl.maximum(m_i, tl.max(S_ij, 1))
+        scale_factor = tl.exp2(m_i - m_ij) # * 1.44269504
+        P_ij = tl.exp2(S_ij - m_ij[:, None])
+        l_i = l_i * scale_factor + tl.sum(P_ij, 1)
+        acc = acc * scale_factor[:, None] + tl.dot(P_ij.to(v_block.type), v_block)
+
+        m_i = m_ij 
+        pass
     # --- END OF STUDENT IMPLEMENTATION ---
 
     # 4. Normalize and write the final output block.
