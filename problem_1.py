@@ -25,14 +25,17 @@ def linear_reference_student(query, key, value, scale=None, initial_state=None,
         k = key[:, :, t].to(state.dtype)
         v = value[:, :, t].to(state.dtype)
 
+
+
         # --- STUDENT IMPLEMENTATION REQUIRED: P1.RECURRENT.UPDATE ---
         # Add the current key/value outer product to state [B,H,Dk,Dv].
-        raise NotImplementedError("P1.RECURRENT.UPDATE: implement the state update")
+        #raise NotImplementedError("P1.RECURRENT.UPDATE: implement the state update")
         # --- END OF STUDENT IMPLEMENTATION ---
-
+        state += k.unsqueeze(-1) @ v.unsqueeze(-1).transpose(-1, -2)
         # --- STUDENT IMPLEMENTATION REQUIRED: P1.RECURRENT.READ ---
         # Set o [B,H,Dv] by reading the UPDATED state with q.
-        raise NotImplementedError("P1.RECURRENT.READ: implement the query read")
+        # raise NotImplementedError("P1.RECURRENT.READ: implement the query read")
+        o = (state.transpose(-1, -2) @ q.unsqueeze(-1)).squeeze(-1)
         # --- END OF STUDENT IMPLEMENTATION ---
 
         out[:, :, t] = o.to(value.dtype)
@@ -61,14 +64,22 @@ def linear_chunk_student(query, key, value, scale=None, initial_state=None,
         # Set o [B,H,C,Dv] from the ENTRY state and local scores [B,H,C,C].
         # Use an inclusive causal mask with zero scores above the diagonal.
         # Do not call linear_reference_student or loop over individual tokens.
-        raise NotImplementedError("P1.CHUNK.OUTPUT: implement inter/intra chunk products")
+        # raise NotImplementedError("P1.CHUNK.OUTPUT: implement inter/intra chunk products")
+        s_ij = q @ k.transpose(-1, -2)
+        q_idx = torch.arange(start, end, device = q.device)
+        k_idx = torch.arange(start, end, device = q.device)
+        s_ij = s_ij.masked_fill(q_idx.unsqueeze(-1) < k_idx.unsqueeze(0) , 0)
+        
+        # inter + intra
+        o = q @ state + s_ij @ v
         # --- END OF STUDENT IMPLEMENTATION ---
-
+    
         out[:, :, start:end] = o.to(value.dtype)
 
         # --- STUDENT IMPLEMENTATION REQUIRED: P1.CHUNK.STATE ---
         # Advance state using this chunk's keys/values, AFTER computing o.
-        raise NotImplementedError("P1.CHUNK.STATE: implement the chunk exit state")
+        #raise NotImplementedError("P1.CHUNK.STATE: implement the chunk exit state")
+        state += k.transpose(-1, -2) @ v
         # --- END OF STUDENT IMPLEMENTATION ---
 
     return finish(out, state, output_final_state)
