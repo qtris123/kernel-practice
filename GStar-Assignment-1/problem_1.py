@@ -78,7 +78,7 @@ class FlashAttention2Function(torch.autograd.Function):
         N_Q_TILES = math.ceil(Sq / Q_TILE_SIZE)
         N_K_TILES = math.ceil(Sh / K_TILE_SIZE)
 
-        scale = 1 / math.sqrt(D)
+        scale = 1 / math.sqrt(D) # Python float
 
         O_o = torch.zeros_like(Q) # float16
         L_o = torch.zeros([Bq, Hq, Sq], device = Q.device, dtype = Q.dtype) # float16
@@ -105,7 +105,16 @@ class FlashAttention2Function(torch.autograd.Function):
                         k_tile = Kbh[k_start: k_end, :]
                         v_tile = Vbh[k_start: k_end, :]
                         # get causal attnn
-                        s_qk = (q_tile.to(torch.float32) @ k_tile.to(torch.float32).T) * scale  # float16
+                        # s_qk = ((q_tile @ k_tile.T) * scale).to(torch.float32)  # multiplies 2 float16 matrices, but accumulate to a float32 output
+                        # this operation means: 
+                        #   1. q_tile @ k_tile.T may use Tensor Cores with FP32 internal accumulatoin
+                        #   2. the matric multiplication results is rounded back to FP16
+                        #   3. Multiplciation by scale (float16 x Python float) gives us a FP16 output
+                        #   4. then scale fp16 to fp32 => This sequence converts the already rounded fp16 to fp32, it cannot recover lost precision
+                        # Another approahc
+                        s_qk = (q_tile @ k_tile.T).float() * scale # .float() performs scaling in FP32 first.
+                        # Before: fp16 x fp16 = fp16 x Python scale -> fp16 -(rounds)-> fp32 ! lost information with low precision scale multiplication
+                        # Now: fp16 x fp16 = float16 -(rounds)-> fp32 x Python scale -> fp32 => keeps information with high precision scale multiplication
                         if is_causal:
                             causal_q = torch.arange(q_start, q_end, device = Q.device).unsqueeze(-1)
                             causal_k = torch.arange(k_start, k_end, device = Q.device).unsqueeze(0)
@@ -134,25 +143,66 @@ class FlashAttention2Function(torch.autograd.Function):
     def backward(ctx, grad_out, grad_L):
         raise NotImplementedError("Backward pass not yet implemented for FlashAttention2Function")
 
+def benchmark_fn(fn, *args, warmup=1, iters=3, **kwargs):
+    # Warmup runs to initialize CUDA kernels and caches
+    for _ in range(warmup):
+        fn(*args, **kwargs)
+    torch.cuda.synchronize()
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    start_event.record()
+    for _ in range(iters):
+        fn(*args, **kwargs)
+    end_event.record()
+    torch.cuda.synchronize()
+
+    return start_event.elapsed_time(end_event) / iters  # average time in milliseconds
+
+
+def naive_attention(q, k, v, is_causal=False):
+    s = (q.float() @ k.float().transpose(-1, -2)) / math.sqrt(q.shape[-1])
+    if is_causal:
+        q_pos = torch.arange(0, q.shape[-2], device=q.device)
+        k_pos = torch.arange(0, k.shape[-2], device=k.device)
+        s.masked_fill_(q_pos[:, None] < k_pos[None, :], -float('inf'))
+    p = torch.softmax(s, dim=-1).to(v.dtype)
+    return p @ v
+
+
 if __name__ == "__main__":
     causal = False
     Q = torch.randn(1, 2, 1024, 32, dtype=torch.float16, device = 'cuda')
     K = torch.randn(1, 2, 1024, 32, dtype=torch.float16, device = 'cuda')
     V = torch.randn(1, 2, 1024, 32, dtype=torch.float16, device = 'cuda')
 
-    O_ref = F.scaled_dot_product_attention(Q, K,V , is_causal=causal)
+    # Accuracy verification
+    O_ref = F.scaled_dot_product_attention(Q, K, V, is_causal=causal)
     O, L = FlashAttention2Function.apply(Q, K, V, causal)
 
     scores = (Q.float() @ K.float().transpose(-1, -2)) / math.sqrt(Q.shape[-1])
     if causal:
-        q_pos = torch.arange(0, Q.shape[-2])
-        k_pos = torch.arange(0, K.shape[-2])
+        q_pos = torch.arange(0, Q.shape[-2], device=Q.device)
+        k_pos = torch.arange(0, K.shape[-2], device=K.device)
         scores.masked_fill_(q_pos[:, None] < k_pos[None, :], -float('inf'))
     L_ref = torch.logsumexp(scores, dim=-1)
-    print("Output max error", (O.float() - O_ref.float()).abs().max().item())
-    print("LSE max error ", (L.float() - L_ref.float()).abs().max().item())
-    print("O:", tuple(O.shape), O.dtype)
-    print("L:", tuple(L.shape), L.dtype)
+
+    print("Accuracy check:")
+    print("  Output max error:", (O.float() - O_ref.float()).abs().max().item())
+    print("  LSE max error:   ", (L.float() - L_ref.float()).abs().max().item())
+    print("  O shape & dtype: ", tuple(O.shape), O.dtype)
+    print("  L shape & dtype: ", tuple(L.shape), L.dtype)
+
+    # Performance timing comparison
+    print("\nTiming comparison (average over 50 iterations):")
+    t_sdpa = benchmark_fn(F.scaled_dot_product_attention, Q, K, V, is_causal=causal)
+    t_naive = benchmark_fn(naive_attention, Q, K, V, is_causal=causal)
+    t_custom = benchmark_fn(FlashAttention2Function.apply, Q, K, V, causal)
+
+    print(f"  PyTorch SDPA (native kernel): {t_sdpa:.4f} ms")
+    print(f"  Standard Naive Attention:    {t_naive:.4f} ms")
+    print(f"  Custom FlashAttention-2:     {t_custom:.4f} ms")
 
 # Output from running python problem1.py
 # Before switching online stats to float32
@@ -168,3 +218,10 @@ if __name__ == "__main__":
 # L: (1, 2, 1024) torch.float16
 
 # => Output max error from 4.88x10^-4 to 1.22x10^-4 and LSE max error from 4.45x10^-3 to 1.95x10^-3
+
+# After s_qk precision scaling adjustment
+#   Output max error: 0.000732421875
+#   LSE max error:    0.001987457275390625
+#   O shape & dtype:  (1, 2, 1024, 32) torch.float16
+#   L shape & dtype:  (1, 2, 1024) torch.float16
+# => Not make quite a difference
