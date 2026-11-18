@@ -179,7 +179,13 @@ if __name__ == "__main__":
 
     # Accuracy verification
     O_ref = F.scaled_dot_product_attention(Q, K, V, is_causal=causal)
-    O, L = FlashAttention2Function.apply(Q, K, V, causal)
+
+    def custom_attention(Q, K, V, causal=True):
+        return FlashAttention2Function.apply(Q, K, V, causal)
+    compiled_attention = torch.compile(custom_attention, mode = "default")
+    with torch.no_grad():
+        O, L = compiled_attention(Q, K, V, causal)
+        torch.cuda.synchronize()
 
     scores = (Q.float() @ K.float().transpose(-1, -2)) / math.sqrt(Q.shape[-1])
     if causal:
@@ -198,7 +204,7 @@ if __name__ == "__main__":
     print("\nTiming comparison (average over 3 iterations):")
     t_sdpa = benchmark_fn(F.scaled_dot_product_attention, Q, K, V, is_causal=causal)
     t_naive = benchmark_fn(naive_attention, Q, K, V, is_causal=causal)
-    t_custom = benchmark_fn(FlashAttention2Function.apply, Q, K, V, causal)
+    t_custom = benchmark_fn(compiled_attention, Q, K, V, causal)
 
     print(f"  PyTorch SDPA (native kernel): {t_sdpa:.4f} ms")
     print(f"  Standard Naive Attention:    {t_naive:.4f} ms")
@@ -239,3 +245,17 @@ if __name__ == "__main__":
 #   PyTorch SDPA (native kernel): 0.1939 ms
 #   Standard Naive Attention:    0.6854 ms
 #   Custom FlashAttention-2:     22.1460 ms
+
+# After torch.compile()
+# Accuracy check:
+#   Output max error: 0.000244140625
+#   LSE max error:    0.002002239227294922
+#   O shape & dtype:  (1, 2, 1024, 32) torch.float16
+#   L shape & dtype:  (1, 2, 1024) torch.float16
+
+# Timing comparison (average over 3 iterations):
+#   PyTorch SDPA (native kernel): 0.1256 ms
+#   Standard Naive Attention:    0.8919 ms
+#   Custom FlashAttention-2:     6.9041 ms
+
+# => Much faster time! 22ms down to 6.9ms
