@@ -78,7 +78,7 @@ class FlashAttention2Function(torch.autograd.Function):
         N_Q_TILES = math.ceil(Sq / Q_TILE_SIZE)
         N_K_TILES = math.ceil(Sh / K_TILE_SIZE)
 
-        scale = 1 / math.sqrt(Hq)
+        scale = 1 / math.sqrt(D)
 
         O_o = torch.zeros_like(Q) # float16
         L_o = torch.zeros([Bq, Hq, Sq], device = Q.device, dtype = Q.dtype) # float16
@@ -95,9 +95,9 @@ class FlashAttention2Function(torch.autograd.Function):
                     q_end = min((q_idx + 1) * Q_TILE_SIZE, Sq)
                     q_tile = Qbh[q_start: q_end, :]
 
-                    local_o = torch.zeros_like(q_tile) # float16
-                    local_m = torch.full((q_tile.shape[0],), -float('inf'), dtype = Q.dtype, device = Q.device) # on-chip with Q
-                    local_lse = torch.zeros(q_tile.shape[0], dtype = Q.dtype, device = Q.device) # on-chip
+                    local_o = torch.zeros_like(q_tile, dtype=torch.float32) # float32
+                    local_m = torch.full((q_tile.shape[0],), -float('inf'), dtype = torch.float32, device = Q.device) # on-chip with Q
+                    local_lse = torch.zeros(q_tile.shape[0], dtype = torch.float32, device = Q.device) # on-chip
                     # for each q_tile, traverse across full KV dimensions to get final attn output for q_tile
                     for k_idx in range(N_K_TILES):
                         k_start = k_idx * K_TILE_SIZE
@@ -105,7 +105,7 @@ class FlashAttention2Function(torch.autograd.Function):
                         k_tile = Kbh[k_start: k_end, :]
                         v_tile = Vbh[k_start: k_end, :]
                         # get causal attnn
-                        s_qk = (q_tile @ k_tile.T) * scale  # float16
+                        s_qk = (q_tile.to(torch.float32) @ k_tile.to(torch.float32).T) * scale  # float16
                         if is_causal:
                             causal_q = torch.arange(q_start, q_end, device = Q.device).unsqueeze(-1)
                             causal_k = torch.arange(k_start, k_end, device = Q.device).unsqueeze(0)
@@ -120,12 +120,13 @@ class FlashAttention2Function(torch.autograd.Function):
                         # add current tiles
                         P_tile = torch.exp(s_qk - new_m.unsqueeze(-1)) # [sq, hk], probabilities
                         local_lse += torch.sum(P_tile, dim=-1) # [sq, sk] - [sq, 1]
-                        local_o += P_tile @ v_tile # [sq, sk] @ [sk, hk] = [sq, hk]
+                        local_o += P_tile @ v_tile.to(torch.float32) # [sq, sk] @ [sk, hk] = [sq, hk]
                         local_m = new_m
                     # set q_tile answer to Ouput
                     reciprocal_lse = torch.where(local_lse > 0, 1 / local_lse, 0)
-                    O_o[b, h, q_start : q_end, :] = local_o * reciprocal_lse.unsqueeze(-1)
-                    L_o[b, h, q_start : q_end] = torch.log(local_lse) + local_m
+                    normalized_out = local_o * reciprocal_lse.unsqueeze(-1)
+                    O_o[b, h, q_start : q_end, :] = normalized_out.to(Q.dtype)
+                    L_o[b, h, q_start : q_end] = (torch.log(local_lse) + local_m).to(Q.dtype)
 
         return O_o, L_o
     
@@ -154,7 +155,16 @@ if __name__ == "__main__":
     print("L:", tuple(L.shape), L.dtype)
 
 # Output from running python problem1.py
-# Output max error 3.1571044921875
-# LSE max error  16.199954986572266
+# Before switching online stats to float32
+# Output max error 0.00048828125
+# LSE max error  0.004456520080566406
 # O: (1, 2, 1024, 32) torch.float16
 # L: (1, 2, 1024) torch.float16
+# 
+# Afterefore switching online stats to float32
+# Output max error 0.0001220703125
+# LSE max error  0.001953125
+# O: (1, 2, 1024, 32) torch.float16
+# L: (1, 2, 1024) torch.float16
+
+# => Output max error from 4.88x10^-4 to 1.22x10^-4 and LSE max error from 4.45x10^-3 to 1.95x10^-3
