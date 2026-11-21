@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import math
 import torch.nn.functional as F
+import torch.cuda.nvtx as nvtx
 
 class FlashAttention2Function(torch.autograd.Function):
     """
@@ -67,78 +68,143 @@ class FlashAttention2Function(torch.autograd.Function):
 
     #     return O_o.to(Q.dtype), L_o
 
-    @staticmethod
-    def forward(ctx, Q, K, V, is_causal = False):
-        Bq, Hq, Sq, D = Q.shape
-        _ , _, Sh, _ = K.shape
+    # @staticmethod
+    # def forward(ctx, Q, K, V, is_causal = False):
+    #     Bq, Hq, Sq, D = Q.shape
+    #     _ , _, Sh, _ = K.shape
 
+    #     Q_TILE_SIZE = 256
+    #     K_TILE_SIZE = 256
+
+    #     N_Q_TILES = math.ceil(Sq / Q_TILE_SIZE)
+    #     N_K_TILES = math.ceil(Sh / K_TILE_SIZE)
+
+    #     scale = 1 / math.sqrt(D) # Python float
+
+    #     O_o = torch.zeros_like(Q) # float16
+    #     L_o = torch.zeros([Bq, Hq, Sq], device = Q.device, dtype = Q.dtype) # float16
+
+    #     # for b in range(Bq):
+    #     #     for h in range(Hq):
+    #     #         Qbh = Q[b, h, :, :]
+    #     #         Kbh = K[b, h, :, :]
+    #     #         Vbh = V[b, h, :, :]
+
+    #     # traverse across tiles of Q
+    #     for q_idx in range(N_Q_TILES):
+    #         q_start = q_idx * Q_TILE_SIZE
+    #         q_end = min((q_idx + 1) * Q_TILE_SIZE, Sq)
+    #         q_tile = Q[:, :, q_start: q_end, :]
+
+    #         local_o = torch.zeros_like(q_tile, dtype=torch.float32) # float32
+    #         local_m = torch.full([Bq, Hq, q_end - q_start], -float('inf'), dtype = torch.float32, device = Q.device) # on-chip with Q
+    #         local_lse = torch.zeros([Bq, Hq, q_end - q_start], dtype = torch.float32, device = Q.device) # on-chip
+    #         # for each q_tile, traverse across full KV dimensions to get final attn output for q_tile
+    #         for k_idx in range(N_K_TILES):
+    #             k_start = k_idx * K_TILE_SIZE
+    #             k_end = min((k_idx + 1) * K_TILE_SIZE, Sh)
+    #             k_tile = K[:, :, k_start: k_end, :]
+    #             v_tile = V[:, :, k_start: k_end, :]
+    #             # get causal attnn
+    #             # s_qk = ((q_tile @ k_tile.T) * scale).to(torch.float32)  # multiplies 2 float16 matrices, but accumulate to a float32 output
+    #             # this operation means: 
+    #             #   1. q_tile @ k_tile.T may use Tensor Cores with FP32 internal accumulatoin
+    #             #   2. the matric multiplication results is rounded back to FP16
+    #             #   3. Multiplciation by scale (float16 x Python float) gives us a FP16 output
+    #             #   4. then scale fp16 to fp32 => This sequence converts the already rounded fp16 to fp32, it cannot recover lost precision
+    #             # Another approahc
+    #             s_qk = (q_tile @ k_tile.transpose(-1, -2)).float() * scale # .float() performs scaling in FP32 first.
+    #             # Before: fp16 x fp16 = fp16 x Python scale -> fp16 -(rounds)-> fp32 ! lost information with low precision scale multiplication
+    #             # Now: fp16 x fp16 = float16 -(rounds)-> fp32 x Python scale -> fp32 => keeps information with high precision scale multiplication
+    #             if is_causal:
+    #                 causal_q = torch.arange(q_start, q_end, device = Q.device).unsqueeze(-1)
+    #                 causal_k = torch.arange(k_start, k_end, device = Q.device).unsqueeze(0)
+    #                 s_qk = s_qk.masked_fill(causal_q < causal_k, -float('inf'))  # float-16, if the indices don't change the dtype
+    #             # update local stats
+    #             new_m = torch.max(s_qk, dim = -1).values
+    #             new_m = torch.maximum(new_m, local_m)
+    #             scale_factor = torch.exp(local_m - new_m) # [s_q,]
+    #             # correct outputs
+    #             local_lse *= scale_factor # [sq]
+    #             local_o *= scale_factor.unsqueeze(-1) # [s_q, h_q] * [s_q,1]
+    #             # add current tiles
+    #             P_tile = torch.exp(s_qk - new_m.unsqueeze(-1)) # [sq, hk], probabilities
+    #             local_lse += torch.sum(P_tile, dim=-1) # [sq, sk] - [sq, 1]
+    #             local_o += P_tile @ v_tile.to(torch.float32) # [sq, sk] @ [sk, hk] = [sq, hk]
+    #             local_m = new_m
+    #         # set q_tile answer to Ouput
+    #         reciprocal_lse = torch.where(local_lse > 0, 1 / local_lse, 0)
+    #         normalized_out = local_o * reciprocal_lse.unsqueeze(-1)
+    #         O_o[:, :, q_start : q_end, :] = normalized_out.to(Q.dtype)
+    #         L_o[:, :, q_start : q_end] = (torch.log(local_lse) + local_m).to(Q.dtype)
+
+    #     return O_o, L_o
+    
+    # Nov 20 : Practice
+    def forward(ctx, Q, K, V, is_causal = False):
+        Bq, Hq, Sq, Dq = Q.shape
+        _, _ , Sk, _ = K.shape
+
+        # initialize block sze
         Q_TILE_SIZE = 256
         K_TILE_SIZE = 256
 
         N_Q_TILES = math.ceil(Sq / Q_TILE_SIZE)
-        N_K_TILES = math.ceil(Sh / K_TILE_SIZE)
+        N_K_TILES = math.ceil(Sk / K_TILE_SIZE)
 
-        scale = 1 / math.sqrt(D) # Python float
+        scale = 1 / math.sqrt(Dq)
 
-        O_o = torch.zeros_like(Q) # float16
-        L_o = torch.zeros([Bq, Hq, Sq], device = Q.device, dtype = Q.dtype) # float16
+        O = torch.zeros_like(Q, dtype=torch.float32, device = Q.device)
+        L = torch.zeros([Bq, Hq, Sq], dtype = torch.float32, device = Q.device)
+        # loop over bh
+        for b in range(Bq):
+            for h in range(Hq):
+                Qbh = Q[b, h, : , :]
+                Kbh = K[b, h, : , :]
+                Vbh = V[b, h, : , :]
 
-        # for b in range(Bq):
-        #     for h in range(Hq):
-        #         Qbh = Q[b, h, :, :]
-        #         Kbh = K[b, h, :, :]
-        #         Vbh = V[b, h, :, :]
+                for i in range(N_Q_TILES):
+                    # get q_tile
+                    start = i * Q_TILE_SIZE
+                    end = min((i + 1) * Q_TILE_SIZE, Sq)
 
-        # traverse across tiles of Q
-        for q_idx in range(N_Q_TILES):
-            q_start = q_idx * Q_TILE_SIZE
-            q_end = min((q_idx + 1) * Q_TILE_SIZE, Sq)
-            q_tile = Q[:, :, q_start: q_end, :]
+                    Q_tile = Qbh[start: end, :]
 
-            local_o = torch.zeros_like(q_tile, dtype=torch.float32) # float32
-            local_m = torch.full([Bq, Hq, q_end - q_start], -float('inf'), dtype = torch.float32, device = Q.device) # on-chip with Q
-            local_lse = torch.zeros([Bq, Hq, q_end - q_start], dtype = torch.float32, device = Q.device) # on-chip
-            # for each q_tile, traverse across full KV dimensions to get final attn output for q_tile
-            for k_idx in range(N_K_TILES):
-                k_start = k_idx * K_TILE_SIZE
-                k_end = min((k_idx + 1) * K_TILE_SIZE, Sh)
-                k_tile = K[:, :, k_start: k_end, :]
-                v_tile = V[:, :, k_start: k_end, :]
-                # get causal attnn
-                # s_qk = ((q_tile @ k_tile.T) * scale).to(torch.float32)  # multiplies 2 float16 matrices, but accumulate to a float32 output
-                # this operation means: 
-                #   1. q_tile @ k_tile.T may use Tensor Cores with FP32 internal accumulatoin
-                #   2. the matric multiplication results is rounded back to FP16
-                #   3. Multiplciation by scale (float16 x Python float) gives us a FP16 output
-                #   4. then scale fp16 to fp32 => This sequence converts the already rounded fp16 to fp32, it cannot recover lost precision
-                # Another approahc
-                s_qk = (q_tile @ k_tile.transpose(-1, -2)).float() * scale # .float() performs scaling in FP32 first.
-                # Before: fp16 x fp16 = fp16 x Python scale -> fp16 -(rounds)-> fp32 ! lost information with low precision scale multiplication
-                # Now: fp16 x fp16 = float16 -(rounds)-> fp32 x Python scale -> fp32 => keeps information with high precision scale multiplication
-                if is_causal:
-                    causal_q = torch.arange(q_start, q_end, device = Q.device).unsqueeze(-1)
-                    causal_k = torch.arange(k_start, k_end, device = Q.device).unsqueeze(0)
-                    s_qk = s_qk.masked_fill(causal_q < causal_k, -float('inf'))  # float-16, if the indices don't change the dtype
-                # update local stats
-                new_m = torch.max(s_qk, dim = -1).values
-                new_m = torch.maximum(new_m, local_m)
-                scale_factor = torch.exp(local_m - new_m) # [s_q,]
-                # correct outputs
-                local_lse *= scale_factor # [sq]
-                local_o *= scale_factor.unsqueeze(-1) # [s_q, h_q] * [s_q,1]
-                # add current tiles
-                P_tile = torch.exp(s_qk - new_m.unsqueeze(-1)) # [sq, hk], probabilities
-                local_lse += torch.sum(P_tile, dim=-1) # [sq, sk] - [sq, 1]
-                local_o += P_tile @ v_tile.to(torch.float32) # [sq, sk] @ [sk, hk] = [sq, hk]
-                local_m = new_m
-            # set q_tile answer to Ouput
-            reciprocal_lse = torch.where(local_lse > 0, 1 / local_lse, 0)
-            normalized_out = local_o * reciprocal_lse.unsqueeze(-1)
-            O_o[:, :, q_start : q_end, :] = normalized_out.to(Q.dtype)
-            L_o[:, :, q_start : q_end] = (torch.log(local_lse) + local_m).to(Q.dtype)
+                    m_i = torch.full([Q_TILE_SIZE], -float('inf'), dtype = torch.float32, device = Q_tile.device)
+                    l_i = torch.zeros([Q_TILE_SIZE], dtype = torch.float32, device = Q_tile.device)
+                    o_i = torch.zeros_like(Q_tile, dtype = torch.float32)
+                    
+                    # for each q_tile, traverse across k_tile, v_tile
+                    for j in range(N_K_TILES):
+                        k_start = j * K_TILE_SIZE
+                        k_end = min((j + 1) * K_TILE_SIZE, Sk)
+                        K_tile = Kbh[k_start: k_end]
+                        V_tile = Vbh[k_start: k_end]
 
-        return O_o, L_o
-    
+                        # calculate attn score
+                        S_ij = (Q_tile @ K_tile.T).float() * scale
+                        S_ij = S_ij.to(torch.float32)
+                        if is_causal:
+                            q_idx = torch.arange(start, end, device = Q_tile.device).unsqueeze(-1)
+                            k_idx = torch.arange(k_start, k_end, device = Q_tile.device).unsqueeze(0)
+                            S_ij = S_ij.masked_fill(q_idx < k_idx, -float('inf'))
+                        # correct stats
+                        new_m = torch.max(S_ij, dim = -1).values
+                        new_m = torch.maximum(new_m, m_i)
+                        scale_factor = torch.exp(m_i - new_m)
+                        l_i *= scale_factor
+                        o_i *= scale_factor.unsqueeze(-1)
+                        # update stats
+                        P_tile = torch.exp(S_ij - new_m.unsqueeze(-1))
+                        l_i += torch.sum(P_tile, dim = -1) # forgot to udpate l_i
+                        o_i += P_tile @ V_tile.to(torch.float32)
+                        m_i =  new_m 
+                    # normalize and update back to final output                
+                    normalized_li = torch.where(l_i > 0, 1 / l_i, 0.0)
+                    O[b, h, start:end, :] = o_i * normalized_li.unsqueeze(-1)
+                    L[b, h, start:end] = torch.log(l_i) + m_i # torch.log not torch.exp
+        return O.to(Q.dtype), L
+
     @staticmethod
     def backward(ctx, grad_out, grad_L):
         raise NotImplementedError("Backward pass not yet implemented for FlashAttention2Function")
@@ -172,20 +238,45 @@ def naive_attention(q, k, v, is_causal=False):
 
 
 if __name__ == "__main__":
-    causal = False
-    Q = torch.randn(1, 2, 1024, 32, dtype=torch.float16, device = 'cuda')
-    K = torch.randn(1, 2, 1024, 32, dtype=torch.float16, device = 'cuda')
-    V = torch.randn(1, 2, 1024, 32, dtype=torch.float16, device = 'cuda')
+    causal = True
+    Q = torch.randn(1, 4, 1024, 64, dtype=torch.float16, device = 'cuda')
+    K = torch.randn(1, 4, 1024, 64, dtype=torch.float16, device = 'cuda')
+    V = torch.randn(1, 4, 1024, 64, dtype=torch.float16, device = 'cuda')
 
-    # Accuracy verification
-    O_ref = F.scaled_dot_product_attention(Q, K, V, is_causal=causal)
+    # # Nsys measurement
+    # #1. Warm up
+    # for _ in range(5):
+    #     F.scaled_dot_product_attention(Q, K, V)
+    #     FlashAttention2Function.apply(Q, K, V)
+    #     torch.cuda.synchronize()
 
-    def custom_attention(Q, K, V, causal=True):
-        return FlashAttention2Function.apply(Q, K, V, causal)
-    compiled_attention = torch.compile(custom_attention, mode = "default")
-    with torch.no_grad():
-        O, L = compiled_attention(Q, K, V, causal)
-        torch.cuda.synchronize()
+    # # Accuracy verification
+    # with nvtx.range("1_Naive"):
+    #     O_naive = naive_attention(Q, K, V)
+    #     torch.cuda.synchronize()
+
+    # with nvtx.range("2_Standard"):
+    #     O_ref = F.scaled_dot_product_attention(Q, K, V)
+    #     torch.cuda.synchronize()
+
+    # with nvtx.range("3_Custom"):
+    #     _ = FlashAttention2Function.apply(Q, K, V)
+    #     torch.cuda.synchronize()
+
+    # def custom_attention(Q, K, V):
+    #     return FlashAttention2Function.apply(Q, K, V)
+    # compiled_attention = torch.compile(custom_attention, mode = "default")
+
+    # # Warmup: JIT compilation happens here (outside the timer)
+    # _ = compiled_attention(Q, K, V)
+    # torch.cuda.synchronize()
+
+    # with nvtx.range("4_Compiled_custom"):
+    #     _ = compiled_attention(Q, K, V)
+    #     torch.cuda.synchronize()
+
+    # Basic Benchmark Comparison
+    O, L = FlashAttention2Function.apply(Q, K, V, True)
 
     scores = (Q.float() @ K.float().transpose(-1, -2)) / math.sqrt(Q.shape[-1])
     if causal:
@@ -193,6 +284,7 @@ if __name__ == "__main__":
         k_pos = torch.arange(0, K.shape[-2], device=K.device)
         scores.masked_fill_(q_pos[:, None] < k_pos[None, :], -float('inf'))
     L_ref = torch.logsumexp(scores, dim=-1)
+    O_ref = torch.softmax(scores, dim = -1).to(V.dtype) @ V
 
     print("Accuracy check:")
     print("  Output max error:", (O.float() - O_ref.float()).abs().max().item())
@@ -204,11 +296,11 @@ if __name__ == "__main__":
     print("\nTiming comparison (average over 3 iterations):")
     t_sdpa = benchmark_fn(F.scaled_dot_product_attention, Q, K, V, is_causal=causal)
     t_naive = benchmark_fn(naive_attention, Q, K, V, is_causal=causal)
-    t_custom = benchmark_fn(compiled_attention, Q, K, V, causal)
+    #t_custom = benchmark_fn(compiled_attention, Q, K, V, causal)
 
     print(f"  PyTorch SDPA (native kernel): {t_sdpa:.4f} ms")
     print(f"  Standard Naive Attention:    {t_naive:.4f} ms")
-    print(f"  Custom FlashAttention-2:     {t_custom:.4f} ms")
+    #print(f"  Custom FlashAttention-2:     {t_custom:.4f} ms")
 
 # Output from running python problem1.py
 # Before switching online stats to float32
